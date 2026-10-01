@@ -1,26 +1,34 @@
 # Ledger Snapshot DPM Component
 
-**Author:** CoBuilders  
-**Status:** Draft  
-**Created:** 2026-07-19  
-**Label:** daml-tooling  
+**Author:** CoBuilders
+
+**Status:** Draft
+
+**Created:** 2026-07-19
+
+**Revised:** 2026-10-01
+
+**Label:** daml-tooling
+
+**Proposal type:** RFP-aligned
+
+**RFP / Roadmap area:** [Developer Experience, Tooling & Education: RFP 19, DPM Components and Extension Ecosystem](https://github.com/canton-foundation/canton-dev-fund/blob/main/2026-2028-strategic-roadmap.md#requests-for-proposals); secondary: RFP 18, Integration into SDLCs
+
 **Champion:** [Need Champion](https://github.com/canton-foundation/canton-dev-fund/blob/main/sig-directory.md)
 
 ---
 
 ## Abstract
 
-This proposal requests funding to build a **Ledger Snapshot** **Plugin** (`dpm ledger-snapshot`). Our goal is to provide an open-source DPM component that brings Hardhat-style **named save/restore** to Canton **local** development.
+CoBuilders proposes `dpm ledger-snapshot`, an open-source DPM component that adds named checkpoints and managed save/restore to a PostgreSQL-backed Canton Sandbox. The default `dpm sandbox` stores state in memory and loses it on shutdown. The component uses Canton’s existing PostgreSQL storage support with an instance supplied by the developer.
 
-Today, developers on Sandbox or LocalNet repeat an expensive bootstrap before every meaningful test pass: start the environment, upload DARs, allocate parties, run setup scripts, then run tests. When tests mutate ledger state, the next suite usually needs that whole bootstrap again. Ethereum teams use `evm_snapshot` and `evm_revert`; Canton has no equivalent packaged as a first-class DPM workflow.
+Developers prepare a ledger fixture once, save it, and restore that baseline between integration or upgrade scenarios, preserving full party IDs, package IDs, and the IDs of contracts active at save. Persisted state also lets them resume work after a reboot.
 
-**Ledger Snapshot** closes that gap for **local environments**. Developers initialize once, `save` a named baseline, run tests, `restore`, and run again without re-running the full bootstrap. The component guarantees an **equivalent ledger state** (parties, packages, Active Contract Set) visible to developers, although not an exact copy, since offsets and contract IDs cannot be matched.
+The component manages Sandbox shutdown and restart so that database capture and restore happen while it is stopped. Restore uses the saved database state without re-uploading DARs, reallocating parties, or recreating contracts.
 
-Ledger Snapshot is complementary to other projects such as Canton DevKit and to the DPM Ledger Operations suite. Those tools help you start LocalNet, inspect ledger state, and run or record tests; Ledger Snapshot restores a saved baseline to be used during testing workflows.
+**Total request: 378,000 CC across three milestones.** Implementation and release take **6 weeks**, followed by adoption and **12 months of maintenance**.
 
-This grant funds the completion of save, restore, and snapshot management and configuration, conformance checks, LocalNet support, OCI distribution, documentation, and ecosystem adoption. A video showing basic functionality of our PoC against Sandbox can be found [**at this link**](https://drive.google.com/file/d/1ZiQQXU-M8DvTxPqwTSGzpA74y-AJk5GI/view?usp=sharing).
-
-Total request: **549,000 CC** across four milestones; Milestones 1–3 span a total of **9 weeks**, with Milestone 4 covering adoption and 12 months of maintenance.
+The component responds to RFP 19 and brings the “Ledger Snapshot Plugin” use case from its linked [DPM use-case list](https://docs.google.com/document/d/1TCkM0Cq4bxIct55wvfZLmr720yhiUCXskN3AKX99lcY/edit?tab=t.0) to Sandbox. LocalNet is excluded because [Canton DevKit](https://bitdynamics-ab.github.io/canton-devkit/) already provides LocalNet snapshot and restore.
 
 ---
 
@@ -28,334 +36,189 @@ Total request: **549,000 CC** across four milestones; Milestones 1–3 span a to
 
 ### 1. Objective
 
-The primary objective of this proposal is to deliver a single, documented, open-source DPM component — `dpm ledger-snapshot` — that lets Canton developers **save and restore named local ledger checkpoints** for deterministic testing on `Sandbox` and **`LocalNet`**, with one consistent CLI, clear equivalence guarantees, and post-restore conformance reporting.
+Deliver `dpm ledger-snapshot`, an open-source DPM component for saving and restoring named snapshots of a Canton Sandbox ledger, with documented commands, explicit compatibility checks, and read-only verification of restored state. Section 2 specifies the commands.
 
 #### Scope
 
-The ledger-snapshot component makes local Canton test environments resettable without repeating full bootstrap. In scope:
+In scope:
 
-- `Sandbox` and `LocalNet` (persistent / Postgres-backed configurations).
-- Named save / restore of developer-visible state (parties, DAR packages, ACS, and target-specific local metadata such as participant ledger or LocalNet DB state as required).
-- Configuration, status, list / describe / delete, conformance check, and test hook.
-- Single DPM CLI with `-target sandbox|local` (implementation may differ per backend).
+- Management of one local PostgreSQL-backed Canton Sandbox through `init`, `start`, `stop`, and `status`.
+- Named snapshot save/restore, read-only verification of restored state, and a test hook.
+- DPM/OCI distribution, documentation, and two runnable reference workflows: repeated upgrade testing, and a CI job that prepares a fixture once and restores its baseline before each suite.
+- Adoption and maintenance.
 
-### 2. Implementation Mechanics
+Out of scope:
 
-Ledger Snapshot is implemented as a thin **DPM CLI component** that orchestrates existing local Canton tooling. At runtime, it talks to a reachable local environment (`Sandbox` or `LocalNet`) over the HTTP JSON / Ledger APIs, captures or restores developer-visible state (parties, packages, ACS, and target-specific local metadata), and stores named checkpoints on disk under `.ledger-snapshots/`. Sandbox restore rebuilds state after a restart: it re-uploads DARs, re-creates parties, and re-creates contracts from the snapshot. LocalNet restore, for supported setups that use Postgres, pauses writing, restores the database or volumes, then starts services again.
+- LocalNet, shared or remote networks, production backup, and disaster recovery.
+- PostgreSQL installation; checkpointing PQS, Splice services, wallets, application databases, or client processes.
+- Host-clock rewind or simulated-time orchestration, package hot-swapping, and automatic migration to arbitrary future runtimes.
 
-Operators install the component via DPM (path or OCI), configure connection settings through flags, env vars, the `daml.yaml` file or an optional `.ledger-snapshot.yaml`, and drive the workflow with `status` → bootstrap once → `save` → mutate → `restore` / `test`, with post-restore **conformance** checks. The subsections below detail packaging, dependencies, snapshot artifacts, backends, and the command surface.
+### 2. Implementation mechanics
 
-#### Example workflow
+Ledger Snapshot configures one managed Canton Sandbox to use Canton’s existing PostgreSQL storage support. It coordinates offline capture and restore of four stores: participant (`sandbox`), sequencer (`sequencer1`), the reference sequencer’s block store, and mediator (`mediator1`). Developers supply the PostgreSQL instance; the component does not install it or require Docker.
 
-```text
-1. Start Sandbox or LocalNet
-2. Upload DARs
-3. Allocate parties
-4. Create initial contracts
-5. Save snapshot baseline
-6. Run test suite A
-7. Restore snapshot baseline
-8. Run test suite B
-9. Restore snapshot baseline
-10. Run integration tests
-```
+`init` checks that the selected Canton runtime can connect to and use the developer-provided PostgreSQL instance, creates the four databases if needed, and records the managed instance’s configuration and databases. On the first `start`, the component launches Sandbox using `dpm sandbox --config <file>` against empty databases. On subsequent starts, including restarts after `save` and `restore`, the component launches the same DPM-provided Canton runtime in daemon mode with the complete Sandbox configuration, without rerunning `bootstrap.canton`. On the tested Canton 3.5.6 configuration, rerunning the bootstrap on persisted stores exits with `TOPOLOGY_MAPPING_ALREADY_EXISTS`, the failure SyncVotes also reports (Motivation).
 
-#### Packaging and install
+`save` and `restore` operate only on the Sandbox registered by `init`, using local endpoints. If the Sandbox uses in-memory storage, its running process does not match the instance record, or the configured databases belong to another Canton instance, `status` reports save/restore as unavailable, and both commands refuse to proceed.
 
-Ledger Snapshot is a **DPM component** (based on [Reference-DPM-Component](https://github.com/canton-network-devs/Reference-DPM-Component)).
+`save` and `restore` require exclusive use of the managed Sandbox and its four dedicated databases. Before either command, the developer must stop application writers and administrative changes, wait for outstanding work to finish, and keep those clients stopped until the command completes. The component serializes its own lifecycle operations with an instance lock.
 
-```yaml
-# Consumer daml.yaml (no sdk-version alongside components)
-components:
-  - oci://ghcr.io/<org>/components/ledger-snapshot:0.x.x
-```
+`save` enumerates parties and packages and reads the full ACS at one ledger offset; that offset applies only to the ACS. Before any database dump or replacement, the component gracefully stops the entire managed Canton process, waits for it to exit, and checks that no other client sessions remain on the four databases. If the process does not exit or unexpected sessions remain, the operation is aborted. Canton remains stopped throughout the database operation, following the consistency requirements described in [Canton’s backup and restore guide](https://docs.canton.network/global-synchronizer/production-operations/node-backup-restore).
 
-```bash
-dpm install package
-dpm ledger-snapshot --help
-```
+`save` captures the four stores using `pg_dump`. `restore` validates all required dumps and checksums before replacing any database using `pg_restore`. It does not re-upload DARs, reallocate parties, or recreate contracts.
 
-**Implementation language:** Our PoC is implemented using Bash (thin CLI orchestrating HTTP JSON API + local process/DB coordination). If ACS restore or conformance logic becomes too complex for shell, those internal modules may be rewritten in other languages; users continue to call the same `dpm ledger-snapshot` commands and flags.
+| Command | When it returns |
+| --- | --- |
+| `save` | The snapshot is finalized and the same Sandbox is restarted without bootstrap, ready for submissions. A restart failure is reported even if the snapshot is valid. |
+| `restore` | The saved databases are restored, Sandbox is restarted without bootstrap, and read-only verification passes. Sandbox is ready for submissions. |
+| `test --snapshot NAME -- CMD` | `CMD` runs only after restore and verification succeed. The command returns when `CMD` finishes. |
 
-Dependencies:
+If restore fails after database replacement begins, the component leaves the Sandbox stopped and does not run the test command.
 
-| Dependency                            | Why it is needed                                                 |
-| ------------------------------------- | ---------------------------------------------------------------- |
-| **DPM** ≥ 1.0.14                      | Host for the component; resolves `dpm ledger-snapshot`           |
-| `canton-open-source` (sandbox)        | Local ledger for sandbox target                                  |
-| `curl` (PoC) / HTTP client            | JSON API probes and capture                                      |
-| **Running local environment**         | Sandbox or LocalNet must be reachable                            |
-| **Docker / Postgres** (LocalNet path) | Safe dump/restore of participant Postgres after stopping writers |
+`conformance` compares full party IDs, package id, name, and version, and the contracts that were active at save. It submits no commands.
 
-#### What a snapshot is
+`start` and `stop` use the recorded instance. `list`, `describe`, and `delete` manage snapshots on disk. `config` shows or stores connection and storage settings. Precedence is CLI flags, then `LEDGER_SNAPSHOT_*`, then `.ledger-snapshot.yaml`, then `daml.yaml`, then defaults (`127.0.0.1`, JSON API `6864`, Ledger API `6865`).
 
-A named directory under `.ledger-snapshots/<name>/` (configurable) containing:
+A snapshot is a directory `.ledger-snapshots/NAME/`. `stores/` is what `restore` applies. `manifest.json` records the schema version, the four-store layout, component and runtime versions, the config hash, the capture offset, the clock mode, and checksums. `parties.json`, `packages.json`, and `acs.json` are used only to verify the restored state.
 
-| Artifact                 | Purpose                                                                    |
-| ------------------------ | -------------------------------------------------------------------------- |
-| `manifest.json`          | Schema version, target, host/ports used, content hashes, equivalence notes |
-| `parties.json`           | Allocated parties                                                          |
-| `packages.json`          | Known / vetted package set                                                 |
-| `acs.json`               | Active Contract Set capture (party-scoped / best-effort → full in grant)   |
-| `dars/` _(Milestone 1+)_ | DAR bytes required for restore (or resolvable project paths)               |
+The snapshot excludes external services such as PQS. Connected applications may retain later changes in their own databases, caches, or saved stream positions. Developers must reset or rebuild that application state to match the restored checkpoint before resuming; restarting the connection alone is insufficient. See the [backup and restore guide](https://docs.canton.network/global-synchronizer/production-operations/node-backup-restore). Restore is limited to tested, compatible runtime versions. Host time is not rewound.
 
-**Guarantee:** an **equivalent developer-visible ledger state** — the same parties, uploaded DAR packages, Active Contract Set (ACS), and other application-visible ledger contents required for deterministic testing. From the perspective of a Daml application or integration test, the restored environment behaves as though it had been freshly bootstrapped to the same initial state.
+Packaging follows [Reference-DPM-Component](https://github.com/canton-network-devs/Reference-DPM-Component) and needs DPM 1.0.17 or newer, which is where `components:` is documented. The consumer `daml.yaml` pins `canton-open-source` and this component and does not set `sdk-version` beside `components:`. The proof of concept is Bash. If dump, restore, or conformance outgrows shell, the commands stay the same. A [recording](https://youtu.be/1b8ppTOEdAA) demonstrates the proof of concept.
 
-**Does not guarantee:** identical timestamps, ledger offsets, or other runtime metadata not required for functional testing (including contract IDs after logical sandbox rebuild).
+### 3. Architectural alignment
 
-#### Architecture: one CLI, two backends
+Ledger Snapshot extends Canton's developer tooling layer by orchestrating the existing Sandbox lifecycle. It ships as a DPM-native component (`components:` in `daml.yaml`, OCI install), matching how Canton developers already acquire tools, and targets the Hardhat-like local development gap highlighted in the [Canton Network developer experience survey analysis](https://forum.canton.network/t/canton-network-developer-experience-and-tooling-survey-analysis-2026/8412) (Motivation). That focus fits CIP-0082-style common-good / dev-tools investments while staying composable with DAR deploy CLIs and with testing and debugging tools. Those tools help set up or inspect the ledger; Ledger Snapshot restores a known Sandbox baseline between test runs, using the documented Canton Postgres backup/restore path (Section 2).
 
-```text
-dpm ledger-snapshot <cmd>
-        │
-        ▼
-   Config layer
-   (CLI flags > env > .ledger-snapshot.yaml > daml.yaml > defaults)
-        │
-   ┌────┴─────┐
-   ▼          ▼
-Sandbox     LocalNet
-backend     backend
-   │          │
-   ▼          ▼
-.ledger-snapshots/<name>/
-```
+### 4. Backward compatibility
 
-| Target   | `--target` | Restore strategy (grant)                                                                                                                                 |
-| -------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Sandbox  | `sandbox`  | **Logical rebuild:** pause/restart sandbox → re-upload/vet DARs → re-allocate parties → recreate ACS from snapshot → conformance                         |
-| LocalNet | `local`    | **Infra restore:** require persistent Postgres → stop writers → restore DB/volumes (documented layout) → restart → optional PQS reset hook → conformance |
-
-#### Basic functionality (command surface)
-
-| Capability                   | Command(s)                                                | Purpose                                                                       |
-| ---------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| **Save**                     | `save <name> --target sandbox\|local`                     | Capture the current local ledger state under a named snapshot.                |
-| **Restore**                  | `restore <name> --target sandbox\|local`                  | Roll the local environment back to that named snapshot.                       |
-| **List / Describe / Delete** | `list`, `describe <name>`, `delete <name>`                | Inspect or remove snapshots stored on disk.                                   |
-| **Status**                   | `status --target sandbox\|local`                          | Detect the environment and report whether snapshot save/restore is available. |
-| **Conformance Check**        | `conformance <name>`                                      | Compare live parties, packages, and ACS against the snapshot.                 |
-| **Test Hook**                | `test --target sandbox\|local --snapshot <name> -- <cmd>` | Restore the snapshot automatically, then run the given test command.          |
-
-**Additional:** `config` — persist or show connection settings (`daml.yaml` or `.ledger-snapshot.yaml`).
-
-**Connection precedence:**
-
-1. **CLI flags** (`-host`, `-json-port`, `-ledger-port`, …)
-2. Environment variables (e.g., `LEDGER_SNAPSHOT_PORT`)
-3. `.ledger-snapshot.yaml`
-4. **defaults** (`127.0.0.1`, JSON `6864`, Ledger `6865` for current `dpm sandbox`).
-
-#### Example commands
-
-```bash
-# Status
-dpm ledger-snapshot status --target local
-dpm ledger-snapshot status --target sandbox
-
-# Save a snapshot
-dpm ledger-snapshot save baseline --target local
-dpm ledger-snapshot save baseline --target sandbox
-
-# Restore a snapshot
-dpm ledger-snapshot restore baseline --target local
-dpm ledger-snapshot restore baseline --target sandbox
-
-# List / describe / delete
-dpm ledger-snapshot list
-dpm ledger-snapshot describe baseline
-dpm ledger-snapshot delete baseline
-
-# Conformance
-dpm ledger-snapshot conformance baseline
-
-# Run a test using a snapshot
-dpm ledger-snapshot test --target sandbox --snapshot baseline -- <test command>
-dpm ledger-snapshot test --target local --snapshot baseline -- <test command>
-```
-
-Public PoC under development demonstrates:
-
-- Installation as a DPM component: `dpm ledger-snapshot`
-- `status` — checks that the local sandbox is reachable
-- `config` — sets host and ports for the project
-- `save` — writes a named snapshot ( manifest, parties, packages, ACS placeholder)
-- `restore` — restores parties only (packages and ACS still in progress)
-
-A video of the PoC demo can be found [**at this link**](https://drive.google.com/file/d/1ZiQQXU-M8DvTxPqwTSGzpA74y-AJk5GI/view?usp=sharing).
-
-#### Challenges and mitigations
-
-| Challenge                                | Why it matters                                                      | Proposed direction                                                                                                        |
-| ---------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| **Supporting both Sandbox and LocalNet** | Developers use both environments.                                   | Provide a single DPM interface, i.e., `--target sandbox\|local`                                                           |
-| **Sandbox is primarily in-memory**       | Restarting clears state but does not support reusable checkpoints.  | Persistable / restart-coordinated snapshot workflow: logical rebuild (re-upload DARs, re-allocate parties, recreate ACS). |
-| **LocalNet persistence**                 | LocalNet commonly relies on PostgreSQL-backed participants.         | Support persistent LocalNet configurations; `status` clearly detects unsupported environments.                            |
-| **Snapshot consistency**                 | Restored environments should behave predictably.                    | Validate parties, packages, and ACS after every restore (`conformance`).                                                  |
-| **Tool synchronization**                 | External components such as PQS may become stale after restoration. | Optional hooks for rebuilding or refreshing dependent services.                                                           |
-| **Safety**                               | Restoring while services continue writing could corrupt state.      | Require restore while local services are quiescent; refuse remote networks.                                               |
-| **Future compatibility**                 | Local runtime implementations evolve over time.                     | Stable developer-facing behavior and versioned `manifest.json`; keep backend details flexible.                            |
-
-### 3. Architectural Alignment
-
-Ledger Snapshot extends Canton’s developer tooling layer by orchestrating existing `Sandbox` and `LocalNet` infrastructure, without new ledger APIs, consensus behavior, or synchronizer changes. It ships as a DPM-native component (`components:` in `daml.yaml`, OCI install), matching how Canton developers already acquire tools, and targets the Hardhat-like local development gap highlighted in the [Canton Network developer experience survey analysis](https://forum.canton.network/t/canton-network-developer-experience-and-tooling-survey-analysis-2026/8412). That focus fits CIP-0082-style common-good / dev-tools investments while staying composable with DAR deploy CLIs, testing and debugging tools, and full LocalNet platforms. Those tools help set up or inspect the ledger; Ledger Snapshot restores a known starting state between test runs.
-
-### 4. Backward Compatibility
-
-_No backward compatibility impact._
-
-The component is additive. It does not modify Canton protocol, Daml language, or existing DPM commands. Projects that do not install the component are unaffected. Snapshot directory format is versioned (`schemaVersion` in `manifest.json`) so future formats can evolve without breaking older snapshots silently.
+No change to the Daml language, the Canton protocol, or existing DPM commands. Projects that do not install the component are unaffected. `schemaVersion` in `manifest.json` keeps a later snapshot format from being restored as if it were this one.
 
 ---
 
 ## Milestones and Deliverables
 
-### Milestone 1: Sandbox restore implementation
+### Milestone 1: Sandbox state restore
 
-- **Estimated Delivery:** 3 weeks from project start
-- **Focus:** Complete the sandbox vertical: reliable save → restore → conformance on `dpm sandbox`, building on the existing PoC.
-- **Deliverables / Value Metrics:**
-  - Public GitHub repository with Apache-2.0 (or Foundation-approved) license.
-  - Public **alpha** of `dpm ledger-snapshot` that supports **`Sandbox` only**;
-  - Commands working end-to-end on sandbox with `-target sandbox`: `status`, `save`, `restore`, `list`, `describe`, `delete`, `conformance` (plus `config` for connection settings).
-  - Restore implements logical rebuild (restart coordination + DAR re-upload/vet + party re-allocation + ACS recreate).
-  - After `save`, a developer can `restore` and get the same packages back on sandbox **without** re-running app setup scripts, either because the snapshot kept the `.dar` files or because restore resolves them from the project’s `.daml/dist/`.
-  - Conformance report compares parties, packages, and ACS fingerprint after restore.
-  - README + architecture notes documenting equivalence guarantees and non-guarantees.
-  - Engage **at least three external teams** as early alpha testers to obtain written feedback that includes issues, notes, or a short evaluation.
+- **Estimated delivery:** 4 weeks from project start.
+- **Funding:** 180,000 CC.
+- **Focus:** Implement the Section 2 path on the persistent Sandbox, from the proof of concept ([recording](https://youtu.be/1b8ppTOEdAA)).
+- **Deliverables / value metrics:**
+    - Public GitHub repository under an Apache-2.0 (or Foundation-approved) license.
+    - Public alpha of `dpm ledger-snapshot` for that path, including `init` and the instance record.
+    - Automated tests cover initial setup with `init` and at least two subsequent restores; refusal of snapshot operations on an in-memory Sandbox; failure reporting for missing, corrupt, or partial dumps, or a nonzero `pg_restore` exit code; acceptance of new commands and preservation of baseline IDs after `save`; client submissions after a standalone `restore` without an additional unpause step; removal of contracts created after `save` and reactivation of baseline contracts archived after `save`; successful submission of a command using a saved contract ID after restore, followed by another restore to return to the saved baseline; and refusal of operations when the instance record is stale.
+    - README for Sections 1–4.
 
-### Milestone 2: (LocalNet backend + OCI distribution)
+### Milestone 2: Stable Sandbox release and go-to-market
 
-- **Estimated Delivery:** 4 weeks after Milestone 1
-- **Focus:** Complete the LocalNet vertical (`-target local`) for persistent configurations; harden ACS capture; publish OCI component; expand docs.
-- **Deliverables / Value Metrics:**
-  - `-target local` implemented for **one documented Persistent LocalNet layout** (compose + Postgres); `status` fails clearly when persistence/layout is unsupported.
-  - Public **alpha** of `dpm ledger-snapshot` that supports **`Sandbox` and `LocalNet`**;
-  - **Offline restore path:** stop LocalNet writers → restore database/volume state → restart, with safety checks.
-  - Optional post-restore hook for PQS / dependent services (document default recommendation).
-  - `dpm ledger-snapshot test --target sandbox|local --snapshot <name> -- <cmd>` test hook.
-  - LocalNet commands parity with sandbox: `status` / `save` / `restore` / `list` / `describe` / `delete` / `conformance` with `-target local`.
-  - OCI publish of the component with versioned tags; install via `dpm install package` from registry (plus local-path install for contributors).
-  - Full command reference, config precedence, sandbox vs LocalNet restore semantics, CI usage examples.
-  - Continue our engagement with **at least three external teams** as early alpha testers to obtain written feedback on both `sandbox` and `LocalNet` environments.
+- **Estimated delivery:** 2 weeks after Milestone 1.
+- **Funding:** 90,000 CC.
+- **Focus:** Release `v1.0.0` for Sandbox development and CI, including the two reference workflows in Scope.
+- **Deliverables / value metrics:**
+    - Tagged `v1.0.0`, installable with `dpm install` from OCI and from a local path for contributors. Release notes list the tested OS, architecture, DPM, and Canton versions, which older snapshots that release can still restore, and save/restore time on the example fixture against a fresh start plus equivalent fixture setup (Motivation).
+    - Both Scope workflows runnable from the public docs: a repeated upgrade scenario, and a CI job that prepares the fixture once, saves a baseline, and restores it before each suite.
+    - Quickstart and example repository, including the PostgreSQL overlay, that a new developer can finish from the docs alone.
+    - Article and video tutorial in English and Spanish.
+    - The Milestone 2 items in Co-Marketing. A request there does not commit the Foundation.
+    - Blocking issues from the Milestone 1 alpha fixed, or documented with a workaround, in the release notes.
 
-### Milestone 3: Production Release and GTM
+### Milestone 3: Adoption and maintenance
 
-- **Estimated Delivery:** 2 weeks after Milestone 2
-- **Focus:** Ship `v1.0.0` and make the component discoverable through docs, tutorials, and Foundation co-marketing.
-- Reach out to as many as possible of the 41 teams that completed the Canton developer survey, and recruit a pilot group to evaluate our component.
-- **Deliverables / Value Metrics:**
-  - Production release: tagged **`v1.0.0`** of `dpm ledger-snapshot` (sandbox + documented LocalNet path), installable via OCI (`dpm install package`), with release notes covering equivalence guarantees and known limits.
-  - **Quickstart tutorial** + **example repository** that a new developer can complete from public docs alone.
-  - **Article and video tutorial**: install → sandbox save/restore (LocalNet path optional). Publish in English and Spanish.
-  - **Discoverability:** submit for inclusion in Canton developer resources / DPM component directories where appropriate; coordinate at least one Foundation co-marketing artifact (technical blog, case study, or video).
-  - Blocking feedback from M1/M2 alpha testing is fixed or documented with workarounds in the `v1.0.0` release notes.
-
-### Milestone 4: Adoption and Maintenance
-
-- **Estimated Delivery:** starts after Milestone 3; maintenance commitment runs **12 months after Milestone 3 completion**
-- **Focus:** Convert early testers into verified external users, prove real-world use, and keep the component compatible with the Canton SDK.
-- **Deliverables / Value Metrics:**
-  - **Alpha conversion:** at least **two** of the M1/M2 early testers validate `v1.0.0` against the quickstart (sandbox required; LocalNet optional where they have a supported layout) and confirm restore removes the need to re-run full bootstrap between suites.
-  - **Adoption:** Document that at least 7 teams from the Canton developer survey have used our component. The main evidence will be a short written confirmation from each team that the committee can verify. Optionally, they can also provide a public link to their `daml.yaml`, CI config, or a public forum post. Package download counts (e.g. OCI/GHCR pulls) may be reported as a secondary signal only.
-  - **Maintenance / SDK compatibility:** keep `dpm ledger-snapshot` working with the current Canton SDK major for **12 months after finishing Milestone 3**. During that window, adapt to new SDK majors within **30 days** of each release.
-  - Public support during the maintenance window: triage issues, ship compatibility releases, and keep docs aligned with supported SDK versions.
-- Co-Marketing: CoBuilders will coordinate with the Foundation on community support and maintenance visibility: shared announcements when external teams adopt the tool or when compatibility releases ship; short community posts (X / forums) highlighting real usage; and Canton Development Fund acknowledgment in the README and release notes.
+- **Estimated delivery:** starts after M2; adoption within 90 days, maintenance for 12 months.
+- **Funding:** 108,000 CC: 36,000 for adoption and 72,000 for maintenance.
+- **Focus:** Verified recurring use on Sandbox, then 12 months of compatibility. Amounts and payment rules stay in Funding.
+- **Deliverables / value metrics:**
+    - **Recurring use.** An external team restores a baseline it saved, in its own repeated Sandbox workflow, and confirms in writing that full party IDs and the contract IDs active at save still resolve. At most three teams count toward the adoption payment (Funding).
+    - **Written evaluations.** Two of those confirmations are short evaluations of the quickstart. The first adoption payment requires both (Funding).
+    - **Maintenance.** For 12 months after Milestone 2, keep the component working with the current Canton SDK major, and adapt to a new SDK major within 30 days of its release. Each compatibility release states which snapshot formats and Canton runtimes it can still restore. Support is issue triage, those releases, and docs kept aligned with Sections 1–4.
+    - One quarterly report per maintenance payment (Funding): compatibility work done, open issues, and any team confirmed that quarter.
+    - The Milestone 3 items in Co-Marketing.
 
 ---
 
-## Acceptance Criteria
+## Acceptance criteria
 
-Project-specific criteria:
-
-- All code in a **public** GitHub repository under an Apache-2.0 (or Foundation-approved) license before any milestone payment.
-- Explicit documentation that restore provides **ACS / party / package equivalence**, not identical contract IDs or offsets.
-- **Milestone 1 value:** at least three external teams provide written alpha feedback on the sandbox path.
-- **Milestone 2 value:** those engagements continue with written feedback covering sandbox and LocalNet where applicable; OCI install path is publicly usable.
-- **Milestone 3 value:** `v1.0.0` is discoverable via public docs/tutorials (EN/ES) and at least one Foundation co-marketing or directory submission; blocking M1/M2 feedback is fixed or documented in release notes.
-- **Milestone 4:** Document and provide evidence that at least 7 of the 41 teams from the Canton developer survey have used our component in their local workflows.
+- The repository is public and Apache-2.0 (or Foundation-approved) before any milestone payment.
+- The only restore path is Section 2.
+- Milestone 1 is accepted when its tests pass on the documented overlay.
+- Milestone 2 is accepted when `v1.0.0`, both reference workflows, and the quickstart are public.
+- Milestone 3 is accepted when adoption and maintenance match that milestone and the Funding section.
 
 ---
 
 ## Funding
 
-**Total Funding Request:** 549,000 CC across four milestones.
+**Total funding request: 378,000 CC across three milestones** 
 
-### Team Dedication per Milestone
+### Team dedication
 
-- Milestone 1 (3 weeks): Technical Lead (0.5 FTE) and Engineer (1 FTE)
-- Milestone 2 (4 weeks): Technical Lead (0.5 FTE) and Engineer (1 FTE)
-- Milestone 3 (2 weeks): Technical Lead (0.5 FTE) and Engineer (1 FTE)
-- Milestone 4: Engineer (0.1 FTE average, demand-driven) and Technical Lead (on demand); effort concentrated on post-release adopter onboarding and evidence collection, SDK-major compatibility windows, and issue triage
+- **M1:** 4 weeks; Technical Lead (Ignacio Fernandez) 0.5 FTE + Engineer (Gimer Cervera) 1 FTE ≈ 240 hours.
+- **M2:** 2 weeks; same team ≈ 120 hours.
+- **M3:** About 8 engineering hours per month for maintenance (96 hours, 72,000 CC), plus up to 48 hours of onboarding support (16 per adopting team, 36,000 CC).
 
-### Payment Breakdown by Milestone
+### Payment breakdown
 
-- Milestone 1 - Sandbox restore implementation: **135,000 CC** upon committee acceptance
-- Milestone 2 - LocalNet backend + OCI distribution: **180,000 CC** upon committee acceptance
-- Milestone 3 - Production Release and GTM: **90,000 CC** upon committee acceptance
-- Milestone 4 - Adoption and Maintenance: **144,000 CC**, split as **72,000 CC** upon committee acceptance of the maintenance and support deliverables, and **72,000 CC** contingent on verified achievement of the adoption target defined in Milestone 4; this tranche may be paid proportionally if the adoption target is partially achieved
+- **M1:** 180,000 CC upon committee acceptance.
+- **M2:** 90,000 CC upon committee acceptance.
+- **M3 maintenance:** 18,000 CC per accepted quarterly report, four payments totaling 72,000 CC.
+- M3 adoption: the committee releases 12,000 CC to CoBuilders for each external team that meets the recurring-use criterion, covering up to 16 hours of onboarding support for that team. At most three teams are paid (36,000 CC). The first of these payments also requires the two written evaluations.
 
-### Volatility Stipulation
+### Volatility stipulation
 
-The grant duration is greater than 6 months. The grant is denominated in fixed Canton Coin, and Milestone 4 will require a re-evaluation at the 6-month mark.
+Funding is denominated in fixed Canton Coin. Review the remaining maintenance/adoption commitment with the committee at six months; no automatic repricing is assumed.
+
+---
+
+## Co-Marketing
+
+CoBuilders will collaborate with the Foundation. Nothing in this list is a commitment by the Foundation.
+
+At the Milestone 2 release:
+
+- Coordinate an announcement on Foundation and CoBuilders channels.
+- Request one technical blog post or short video: install via DPM, prepare a Sandbox fixture, `save`, then `restore` between suites.
+- Submit the component for Canton developer documentation and DPM component directories where those lists exist.
+
+During Milestone 3:
+
+- A short community post when an external team adopts the component or a compatibility release ships.
+- A Canton Development Fund acknowledgment in the README and release notes.
 
 ---
 
 ## Motivation
 
-We are proposing Ledger Snapshot to contribute directly to Canton developer adoption and ecosystem growth by reducing the friction of local testing, enabling more builders to iterate faster, stay on the network, and ship reliable applications.
+Canton’s [testing guidance](https://docs.canton.network/appdev/modules/m5-testing-strategies#test-isolation) suggests reusing a running instance with unique parties and users to reduce setup overhead and support parallel tests. The default [`dpm sandbox`](https://docs.canton.network/sdks-tools/development-tools/sandbox), however, stores its ledger in memory and loses that state on shutdown. 
 
-Every local Canton test loop that mutates ledger state pays a tax: re-upload DARs, re-allocate parties, re-run setup scripts. That tax grows with suite size and with CI parallelism. Ethereum developers arriving on Canton (a large share of survey respondents) expect Hardhat-style snapshot/revert; its absence is a concrete DX gap in **Local Development Frameworks**, repeatedly rated among the most urgent tooling needs according to the Canton’s [Tooling Survey Analysis](https://forum.canton.network/t/canton-network-developer-experience-and-tooling-survey-analysis-2026/8412) and the [DPM Component Use Cases](https://docs.google.com/document/d/1TCkM0Cq4bxIct55wvfZLmr720yhiUCXskN3AKX99lcY/edit?tab=t.0) proposed by the Canton Foundation.
+- **Re-running upgrade tests from a prepared first-version state.** Canton rejects a second package with the same name and version as one already vetted when the content differs ([`KNOWN_PACKAGE_VERSION`](https://github.com/digital-asset/canton/blob/c548c9ba15d1f22f820ec2409d972b2b9e04a73b/community/base/src/main/scala/com/digitalasset/canton/topology/TopologyManagerError.scala#L1345-L1365)); the [Daml upgrade guide](https://github.com/digital-asset/daml/blob/1913ae3cf595c7e37ae03b075307621d534f02ec/sdk/docs/manually-written/sdk/sdlc-howtos/smart-contracts/upgrade/smart-contract-upgrades.rst?plain=1#L1649-L1658) documents restart and version changes as workarounds. Restarting an in-memory Sandbox also discards the prepared fixture. Changing a candidate’s version or replacing its vetting can permit another iteration, but neither recovers first-version contracts consumed by the preceding test. A checkpoint taken after preparing the v1 fixture and before uploading v2 restores the contracts, packages and vetting together. Each revised candidate can then be tested at the same intended v2 version against the original v1 contracts, with the v1 contract IDs unchanged.
+- **Keeping a development ledger across sessions.** SyncVotes configured its SDK 3.4.11 Sandbox to retain parties and contracts in a local H2 database, then documented that restarting persisted state on SDK 3.5.7 failed with `TOPOLOGY_MAPPING_ALREADY_EXISTS` and described its local Sandbox as a scratch ledger ([configuration](https://github.com/SYNCVOTES/syncvotes/blob/807deefabeef8c2b3175556fa31178a001c73287/canton.conf#L1-L4), [restart report](https://github.com/SYNCVOTES/syncvotes/blob/0a52898998c8815115ae4fe4e599edcb8d1e94c6/README.md?plain=1#L160-L162)). This illustrates why a storage overlay alone is insufficient. The component manages persistent Sandbox storage and resumes initialized nodes without repeating the Sandbox bootstrap, allowing developers to continue from their prepared ledger after shutdown.
 
-Ledger Snapshot benefits:
+**Who benefits.** Application teams using Sandbox for development and integration testing, with PostgreSQL available locally or in CI. For suites that already start fresh on every run, we will publish restore timings against a fresh start plus equivalent fixture setup. The IDE ledger used by `dpm test`, and LocalNet, are outside scope.
 
-- **Application teams** iterating on Daml models and integration tests (sandbox daily, LocalNet for multi-party topologies).
-- **CI pipelines** that need deterministic fixtures without rebuilding the world each job step.
-- **Tooling authors** who can compose checkpointing with deploy/debug components instead of reinventing bootstrap.
-
-According to Canton’s Testing Pyramid, developers should use `Sandbox` and `LocalNet` for [**integration testing against a live ledger**](https://docs.canton.network/appdev/modules/m5-testing-strategies). Any team with more than one mutating test suite benefits from named save/restore, which resets a known baseline between runs without repeating full bootstrap. We expect early adopters among teams already running LocalNet CI and developers who want a first-class local snapshot/revert workflow.
+**How it supports adoption.** The [2026 developer survey](https://forum.canton.network/t/canton-network-developer-experience-and-tooling-survey-analysis-2026/8412) identified local development frameworks as the most critical tooling gap. This component addresses one concrete part of that gap through the DPM workflow developers already use. The published upgrade-testing example and CI workflow (Milestone 2)  will give teams practical starting points for using checkpoints in their own projects.
 
 ---
 
 ## Rationale
 
-**Why a Ledger Snapshot DPM Component?**
+**Why state restore.** Rebuilding a fixture by uploading DARs and creating contracts again does not keep party and contract IDs, and it can fail vetting with `KNOWN_PACKAGE_VERSION` (Motivation). This proposal does not include that rebuild. The only path is the stopped-store restore in Section 2, which does not hot-swap packages or bypass smart contract upgrade.
 
-Named save/restore is the proven pattern for local smart-contract test isolation. Canton cannot copy `evm_snapshot` as a protocol RPC; the right place for this UX is a **local orchestration layer** that respects sandbox (logical rebuild) and LocalNet (persistent DB) realities while presenting one developer workflow.
+**Why a DPM component under RFP 19.** Named checkpoints are not a ledger API. RFP 19 asks for reusable DPM components with documentation, examples, and a maintenance plan. The CI workflow and the test hook also match RFP 18. The funded artifact is the component, so the proposal is classified under RFP 19, with RFP 18 secondary, as in the header.
 
-**Why a DPM component instead of a standalone npm/Homebrew tool?**
+**Why a component rather than a one-off script?** Canton can already run scripts headlessly. This component is the reusable checkpoint: the instance record and command boundaries in Section 2, plus a test hook, so a project does not write its own dump and restart sequence. That value does not depend on the current bootstrap issue (Motivation): if a future Sandbox bootstrap tolerates a persisted store, the restart step gets simpler, but a consistent capture of all four stores with writers stopped, a verified restore, and conformance are still needed. It does not replace `dpm script` or Canton Console.
 
-- Canton developers already use DPM; components pin per project and track SDK generations.
-- Install and discovery match other first-party and community tools (`dpm install package`, OCI refs).
-- Avoids introducing a parallel global toolchain.
+---
 
-**Why not only extend Canton Console or an existing LocalNet platform proposal?**
+## Why us
 
-Console is an operator REPL, not a CI-friendly CLI. Broader LocalNet platforms solve topology/bootstrap; this proposal does **one job** — checkpoints — and remains composable. Extending those platforms would couple release cadence and scope; a focused DPM component can ship and be adopted independently.
+CoBuilders is a Web3 engineering studio. We have delivered work for and alongside **Arbitrum, the Nomic Foundation, OpenZeppelin, CoW Protocol, Tools for Humanity (World), and ZetaChain**. More at [cobuilders.xyz](https://www.cobuilders.xyz/).
 
-**Why sandbox and LocalNet?**
+The track record most relevant here:
 
-Developers use both: sandbox for day-to-day work, LocalNet for multi-party and CI setups. Supporting only one would leave the other workflow behind. We implement one CLI to cover both; the restore method differs under the hood, but the developer experience stays the same.
-
-**Default approach:** extend the existing DPM ecosystem with a new component; do not replace `dpm script`, `damlc`, or Canton itself.
-
-**Why not only extend an existing proposal?**
-
-A ledger snapshot component is explicitly required in the [DPM Component Use Cases List](https://docs.google.com/document/d/1TCkM0Cq4bxIct55wvfZLmr720yhiUCXskN3AKX99lcY/edit?tab=t.0) for the community. Our proposal is complementary to other projects such as [Canton DevKit](https://github.com/canton-foundation/canton-dev-fund/pull/18/changes), not a competing `LocalNet` platform. DevKit focuses on starting, managing, observing, and testing against Splice LocalNet. Ledger Snapshot focuses on Hardhat-style named save/restore of a developer's visible ledger state (i.e., parties, packages, and ACS) on both `sandbox` and `LocalNet`, with explicit equivalence guarantees, post-restore conformance, and a test hook, so developers can reset without re-running full bootstrap. While DevKit’s snapshot/restore is a LocalNet convenience for demos and workshops, we deliver a dedicated checkpointing workflow that works the same way on **sandbox and LocalNet**, filling the sandbox gap that DevKit does not cover.
-
-This proposal is also complementary to the [DPM Ledger Operations and Reproducible Testing Suite (PR #520)](https://github.com/canton-foundation/canton-dev-fund/pull/520). That suite targets the post-deployment layer: scriptable query and submission, fee estimation, and table-driven tests whose runs are recorded in a journal for exact replay. It explicitly dropped its own ledger snapshot milestone in favor of integrating with environment-level snapshot and restore where available. Ledger Snapshot supplies that missing checkpoint layer (named save and restore of parties, packages, and ACS on sandbox and LocalNet), so their test suites can reset the ledger between runs without redoing full bootstrap. At the same time, we do not duplicate their query, estimate, or journal tools.
-
-## Why Us
-
-CoBuilders is a Web3 studio that builds and runs experienced, blockchain-native, interdisciplinary teams that help the most impactful decentralized finance projects turn their vision into reality. We have delivered work for and alongside teams like **Arbitrum, the Nomic Foundation, OpenZeppelin, CoW Protocol, Tools for Humanity (World), and ZetaChain, among others**. More about us at [cobuilders.xyz](https://www.cobuilders.xyz/).
-
-The track record most relevant to this proposal:
-
-- **Hardhat plugin suite for Arbitrum Stylus** ([`@cobuilders/hardhat-arbitrum-stylus`](https://www.npmjs.com/package/@cobuilders/hardhat-arbitrum-stylus), live on npm). A Hardhat 3 plugin suite that brings the full Stylus lifecycle (local node, compile, deploy, test) into Hardhat: four composable plugins, automatic EVM vs WASM contract detection, and cross-VM testing in a single project. Built with support from the Arbitrum Stylus Sprint. **This is the direct precedent for Ledger Snapshot**: an ecosystem-native plugin that packages a missing local development workflow into the toolchain developers already use. [Repo](https://github.com/CoBuilders-xyz/hardhat-arbitrum-stylus) \| [Docs](https://cobuilders-xyz.github.io/hardhat-arbitrum-stylus/)
-- **Hardhat 3 migration work with the Nomic Foundation.** This proposal ports a Hardhat pattern (`evm_snapshot` / `evm_revert`) to Canton. We know that pattern from inside the Hardhat ecosystem, as plugin authors and through migration work with Hardhat's creators.
+- **Hardhat plugin suite for Arbitrum Stylus** ([`@cobuilders/hardhat-arbitrum-stylus`](https://www.npmjs.com/package/%40cobuilders/hardhat-arbitrum-stylus), live on npm). A Hardhat 3 plugin suite that brings the Stylus lifecycle (local node, compile, deploy, test) into Hardhat: four composable plugins, automatic EVM vs WASM detection, and cross-VM testing in one project. Built with support from the Arbitrum Stylus Sprint. It is the same pattern as this proposal: a missing local workflow added to the toolchain developers already use. [Repo](https://github.com/CoBuilders-xyz/hardhat-arbitrum-stylus) | [Docs](https://cobuilders-xyz.github.io/hardhat-arbitrum-stylus/)
+- **Direct work with the Nomic Foundation**. We have provided technical capacity directly to the team behind Hardhat. Working with Hardhat’s creators is strong evidence of our fit for this proposal.
 
 Proposed team:
 
-- Augusto Collerone, CTO and Co-Founder: [LinkedIn](https://www.linkedin.com/in/augusto-collerone/) [GitHub](https://github.com/augustocollerone)
-- Ignacio Fernandez, Technical Lead: [LinkedIn](https://www.linkedin.com/in/ignacio-fq/) [GitHub](https://github.com/nachfq)
-- Gimer Cervera, Ph.D., Blockchain Engineer: [LinkedIn](https://www.linkedin.com/in/gimercervera/) [GitHub](https://github.com/Gimer0x)
+- Augusto Collerone, CTO and Co-Founder: [LinkedIn](https://www.linkedin.com/in/augusto-collerone/) | [GitHub](https://github.com/augustocollerone)
+- Ignacio Fernandez, Technical Lead: [LinkedIn](https://www.linkedin.com/in/ignacio-fq/) | [GitHub](https://github.com/nachfq)
+- Gimer Cervera, Ph.D., Blockchain Engineer: [LinkedIn](https://www.linkedin.com/in/gimercervera/) | [GitHub](https://github.com/Gimer0x)
